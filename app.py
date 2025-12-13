@@ -1,353 +1,234 @@
-from flask import Flask, request, jsonify, make_response, render_template_string
-from flask_bcrypt import Bcrypt
-from functools import wraps
-import datetime
-import jwt
-import xmltodict
-import importlib
-import os
+from flask import Flask, request, jsonify, make_response
+import mysql.connector
+from mysql.connector import Error
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+from werkzeug.security import check_password_hash  # ✅ Import at top
 
-# ----------------------------------
-# APP SETUP
-# ----------------------------------
 app = Flask(__name__)
-bcrypt = Bcrypt(app)
 
-app.config["SECRET_KEY"] = "supersecretkey"
-app.config["JWT_EXP_HOURS"] = 2
+# Database config
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': '',          # Update if needed
+    'database': 'testdb'
+}
 
-# ----------------------------------
-# DATABASE (MySQL with SQLite fallback)
-# ----------------------------------
-mysql_connector = None
-try:
-    mysql_connector = importlib.import_module("mysql.connector")
-    MYSQL_AVAILABLE = True
-except Exception:
-    MYSQL_AVAILABLE = False
+def get_db_connection():
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        return conn
+    except Error as e:
+        print(f"Database connection error: {e}")
+        return None
 
-if MYSQL_AVAILABLE:
-    db = mysql_connector.connect(
-        host="localhost",
-        user="root",
-        password="root",
-        database="library_db"
-    )
-    cursor = db.cursor(dictionary=True)
-else:
-    import sqlite3
-    conn = sqlite3.connect("library.sqlite3", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    raw = conn.cursor()
+def user_to_xml(users):
+    root = ET.Element("users")
+    for user in users:
+        user_elem = ET.SubElement(root, "user")
+        ET.SubElement(user_elem, "id").text = str(user['id'])
+        ET.SubElement(user_elem, "name").text = user['name']
+        ET.SubElement(user_elem, "email").text = user['email']
+        ET.SubElement(user_elem, "age").text = str(user['age']) if user['age'] else ''
+    rough = ET.tostring(root, 'utf-8')
+    reparsed = minidom.parseString(rough)
+    return reparsed.toprettyxml(indent="  ")
 
-    class Cursor:
-        def execute(self, sql, params=()):
-            raw.execute(sql.replace("%s", "?"), params)
+def get_format():
+    fmt = request.args.get('format', 'json').lower()
+    if fmt not in ['json', 'xml']:
+        fmt = 'json'
+    return fmt
 
-        def fetchone(self):
-            row = raw.fetchone()
-            return dict(row) if row else None
+# Helper to fetch all users
+def fetch_all_users():
+    conn = get_db_connection()
+    if not conn:
+        return []
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users")
+    users = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return users
 
-        def fetchall(self):
-            return [dict(r) for r in raw.fetchall()]
-
-    cursor = Cursor()
-    db = conn
-
-    raw.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            password TEXT
-        )
-    """)
-
-    raw.execute("""
-        CREATE TABLE IF NOT EXISTS books (
-            book_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            author TEXT,
-            genre TEXT,
-            publish_year INTEGER,
-            isbn TEXT,
-            available_copies INTEGER,
-            date_added TEXT
-        )
-    """)
-    conn.commit()
-
-def seed_books():
-    cursor.execute("SELECT COUNT(*) AS total FROM books")
-    result = cursor.fetchone()
-
-    # for SQLite fallback compatibility
-    total = list(result.values())[0] if isinstance(result, dict) else result[0]
-
-    if total > 0:
-        return  # already seeded
-
-    books = [
-    ("The Great Gatsby", "F. Scott Fitzgerald", "Fiction", 1925, "9780743273565", 5),
-    ("1984", "George Orwell", "Dystopian", 1949, "9780451524935", 3),
-    ("To Kill a Mockingbird", "Harper Lee", "Classic", 1960, "9780061120084", 7),
-    ("Harry Potter and the Sorcerer's Stone", "J.K. Rowling", "Fantasy", 1997, "9780590353427", 10),
-    ("The Hobbit", "J.R.R. Tolkien", "Fantasy", 1937, "9780547928227", 4),
-    ("Pride and Prejudice", "Jane Austen", "Romance", 1813, "9780141439518", 6),
-    ("Moby Dick", "Herman Melville", "Adventure", 1851, "9781503280786", 2),
-    ("The Catcher in the Rye", "J.D. Salinger", "Fiction", 1951, "9780316769488", 5),
-    ("Brave New World", "Aldous Huxley", "Sci-Fi", 1932, "9780060850524", 3),
-    ("The Lord of the Rings", "J.R.R. Tolkien", "Fantasy", 1954, "9780618640157", 8),
-    ("The Alchemist", "Paulo Coelho", "Fiction", 1988, "9780061122415", 4),
-    ("The Da Vinci Code", "Dan Brown", "Mystery", 2003, "9780307474278", 9),
-    ("The Picture of Dorian Gray", "Oscar Wilde", "Classic", 1890, "9780141442464", 5),
-    ("The Shining", "Stephen King", "Horror", 1977, "9780307743657", 3),
-    ("The Hunger Games", "Suzanne Collins", "Sci-Fi", 2008, "9780439023481", 7),
-    ("The Fault in Our Stars", "John Green", "Romance", 2012, "9780525478812", 6),
-    ("IT", "Stephen King", "Horror", 1986, "9781501142970", 4),
-    ("The Maze Runner", "James Dashner", "Sci-Fi", 2009, "9780385737951", 6),
-    ("The Girl on the Train", "Paula Hawkins", "Thriller", 2015, "9781594634024", 5),
-    ("The Silent Patient", "Alex Michaelides", "Thriller", 2019, "9781250301697", 4),
-]
-
-
-    for b in books:
-        cursor.execute("""
-            INSERT INTO books (title, author, genre, publish_year, isbn, available_copies, date_added)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            b[0], b[1], b[2], b[3], b[4], b[5],
-            datetime.date.today().isoformat()
-        ))
-
-    db.commit()
-
-
-# ----------------------------------
-# JWT DECORATOR
-# ----------------------------------
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get("Authorization")
-        if not token:
-            return jsonify({"error": "Token missing"}), 401
-
-        try:
-            jwt.decode(token.replace("Bearer ", ""), app.config["SECRET_KEY"], algorithms=["HS256"])
-        except:
-            return jsonify({"error": "Invalid or expired token"}), 401
-
-        return f(*args, **kwargs)
-    return decorated
-
-# ----------------------------------
-# FORMAT RESPONSE (JSON / XML)
-# ----------------------------------
-def respond(data):
-    fmt = request.args.get("format", "json")
-    if fmt == "xml":
-        xml = xmltodict.unparse({"response": data}, pretty=True)
-        res = make_response(xml)
-        res.headers["Content-Type"] = "application/xml"
-        return res
-    return jsonify(data)
-
-# ----------------------------------
-# AUTH ROUTES
-# ----------------------------------
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "GET":
-        return """
-        <h1>Register</h1>
-        <form method="POST">
-            <input name="username" placeholder="Username" required><br><br>
-            <input name="password" type="password" placeholder="Password" required><br><br>
-            <button type="submit">Register</button>
-        </form>
-        """
-
-    # POST
-    data = request.form
-    username = data.get("username")
-    password = data.get("password")
-
-    cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
-    if cursor.fetchone():
-        return "User already exists"
-
-    pw_hash = bcrypt.generate_password_hash(password).decode("utf-8")
-    cursor.execute(
-        "INSERT INTO users (username, password) VALUES (%s, %s)",
-        (username, pw_hash)
-    )
-    db.commit()
-
-    return "<h3>Registration successful</h3><a href='/login'>Login</a>"
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "GET":
-        return """
-        <h1>Login</h1>
-        <form method="POST">
-            <input name="username" placeholder="Username" required><br><br>
-            <input name="password" type="password" placeholder="Password" required><br><br>
-            <button type="submit">Login</button>
-        </form>
-        """
-
-    # POST
-    data = request.form
-    username = data.get("username")
-    password = data.get("password")
-
-    cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
+# Helper to fetch user by ID
+def fetch_user_by_id(user_id):
+    conn = get_db_connection()
+    if not conn:
+        return None
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
     user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return user
 
-    if not user or not bcrypt.check_password_hash(user["password"], password):
-        return "Invalid credentials"
+# CREATE
+@app.route('/users', methods=['POST'])
+def create_user():
+    data = request.get_json()
+    name = data.get('name')
+    email = data.get('email')
+    age = data.get('age')
 
-    return "<h3>Login successful</h3><a href='/books'>View Books</a>"
+    if not name or not email:
+        return jsonify({'error': 'Name and email required'}), 400
 
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database error'}), 500
 
-# ----------------------------------
-# PUBLIC BOOK VIEW (NO TOKEN)
-# ----------------------------------
-@app.route("/books")
-def books_page():
-    cursor.execute("SELECT * FROM books")
-    books = cursor.fetchall()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO users (name, email, age) VALUES (%s, %s, %s)",
+            (name, email, age)
+        )
+        conn.commit()
+        user_id = cursor.lastrowid
+        cursor.close()
+        conn.close()
 
-    html = """
-    <h1>Library Books</h1>
-    {% for b in books %}
-    <pre>
-Book ID: {{b.book_id}}
-Title: {{b.title}}
-Author: {{b.author}}
-Genre: {{b.genre}}
-Publish Year: {{b.publish_year}}
-ISBN: {{b.isbn}}
-Available Copies: {{b.available_copies}}
-Date Added: {{b.date_added or 'N/A'}}
--------------------------
-    </pre>
-    {% endfor %}
-    """
-    return render_template_string(html, books=books)
+        new_user = {'id': user_id, 'name': name, 'email': email, 'age': age}
+        fmt = get_format()
+        if fmt == 'xml':
+            xml_str = user_to_xml([new_user])
+            response = make_response(xml_str)
+            response.headers['Content-Type'] = 'application/xml'
+            return response
+        else:
+            return jsonify(new_user), 201
+    except mysql.connector.IntegrityError:
+        cursor.close()
+        conn.close()
+        return jsonify({'error': 'Email already exists'}), 409
 
-# ----------------------------------
-# CRUD API (PROTECTED)
-# ----------------------------------
-@app.route("/api/books", methods=["GET"])
-@token_required
-def get_books():
-    cursor.execute("SELECT * FROM books")
-    return respond(cursor.fetchall())
+# READ all
+@app.route('/users', methods=['GET'])
+def get_users():
+    users = fetch_all_users()
+    fmt = get_format()
+    if fmt == 'xml':
+        xml_str = user_to_xml(users)
+        response = make_response(xml_str)
+        response.headers['Content-Type'] = 'application/xml'
+        return response
+    else:
+        return jsonify(users)
 
-@app.route("/api/books/<int:id>", methods=["GET"])
-@token_required
-def get_book(id):
-    cursor.execute("SELECT * FROM books WHERE book_id=%s", (id,))
-    book = cursor.fetchone()
-    if not book:
-        return jsonify({"error": "Not found"}), 404
-    return respond(book)
+# READ one
+@app.route('/users/<int:user_id>', methods=['GET'])
+def get_user(user_id):
+    user = fetch_user_by_id(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
 
-@app.route("/api/books", methods=["POST"])
-@token_required
-def add_book():
-    data = request.json
-    required = ["title", "author", "genre", "publish_year", "isbn", "available_copies"]
-    if not all(k in data for k in required):
-        return jsonify({"error": "Missing fields"}), 400
+    fmt = get_format()
+    if fmt == 'xml':
+        xml_str = user_to_xml([user])
+        response = make_response(xml_str)
+        response.headers['Content-Type'] = 'application/xml'
+        return response
+    else:
+        return jsonify(user)
 
-    cursor.execute("""
-        INSERT INTO books VALUES (NULL,%s,%s,%s,%s,%s,%s,%s)
-    """, (
-        data["title"], data["author"], data["genre"],
-        data["publish_year"], data["isbn"],
-        data["available_copies"],
-        datetime.date.today().isoformat()
-    ))
-    db.commit()
-    return jsonify({"message": "Book added"}), 201
+# UPDATE
+@app.route('/users/<int:user_id>', methods=['PUT'])
+def update_user(user_id):
+    user = fetch_user_by_id(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
 
-@app.route("/api/books/<int:id>", methods=["PUT"])
-@token_required
-def update_book(id):
-    data = request.json
-    cursor.execute("""
-        UPDATE books SET title=%s, genre=%s, available_copies=%s WHERE book_id=%s
-    """, (data["title"], data["genre"], data["available_copies"], id))
-    db.commit()
-    return jsonify({"message": "Book updated"})
+    data = request.get_json()
+    name = data.get('name', user['name'])
+    email = data.get('email', user['email'])
+    age = data.get('age', user['age'])
 
-@app.route("/api/books/<int:id>", methods=["DELETE"])
-@token_required
-def delete_book(id):
-    cursor.execute("DELETE FROM books WHERE book_id=%s", (id,))
-    db.commit()
-    return jsonify({"message": "Book deleted"})
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database error'}), 500
 
-@app.route("/books/<int:id>")
-def view_book(id):
-    cursor.execute("SELECT * FROM books WHERE book_id = %s", (id,))
-    book = cursor.fetchone()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "UPDATE users SET name = %s, email = %s, age = %s WHERE id = %s",
+            (name, email, age, user_id)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
 
-    if not book:
-        return "<h1>Book not found</h1>", 404
+        updated_user = {'id': user_id, 'name': name, 'email': email, 'age': age}
+        fmt = get_format()
+        if fmt == 'xml':
+            xml_str = user_to_xml([updated_user])
+            response = make_response(xml_str)
+            response.headers['Content-Type'] = 'application/xml'
+            return response
+        else:
+            return jsonify(updated_user)
+    except mysql.connector.IntegrityError:
+        cursor.close()
+        conn.close()
+        return jsonify({'error': 'Email already exists'}), 409
 
-    html = f"""
-    <h1>{book['title']}</h1>
-    <p><strong>Book ID:</strong> {book['book_id']}</p>
-    <p><strong>Genre:</strong> {book['genre']}</p>
-    <p><strong>Publish Year:</strong> {book['publish_year']}</p>
-    <p><strong>ISBN:</strong> {book['isbn']}</p>
-    <p><strong>Available Copies:</strong> {book['available_copies']}</p>
+# DELETE
+@app.route('/users/<int:user_id>', methods=['DELETE'])
+def delete_user(user_id):
+    user = fetch_user_by_id(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
 
-    <br>
-    <a href="/books">⬅ Back to Books</a>
-    """
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database error'}), 500
 
-    return html
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-# ----------------------------------
-# SEARCH
-# ----------------------------------
-@app.route("/api/search")
-@token_required
-def search():
-    q = request.args.get("q", "")
-    cursor.execute("SELECT * FROM books WHERE title LIKE %s OR genre LIKE %s",
-                   (f"%{q}%", f"%{q}%"))
-    return respond(cursor.fetchall())
+    return jsonify({'message': 'User deleted'}), 200
 
-# ----------------------------------
-@app.route("/")
-def index():
-    return jsonify({"message": "Library API Running"})
+# LOGIN
+@app.route('/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
 
-@app.route("/authors")
-def authors_page():
-    cursor.execute("SELECT DISTINCT author FROM books WHERE author IS NOT NULL AND author != ''")
-    authors = cursor.fetchall()
+    if not email or not password:
+        return jsonify({'error': 'Email and password required'}), 400
 
-    html = """
-    <h1>Authors</h1>
-    <ul>
-    {% for a in authors %}
-        <li>{{ a.author }}</li>
-    {% endfor %}
-    </ul>
-    <br>
-    <a href="/books">⬅ Back to Books</a>
-    """
-    return render_template_string(html, authors=authors)
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database error'}), 500
 
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, name, email, password FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
 
-if __name__ == "__main__":
-    seed_books()   
+    if user and user.get('password') and check_password_hash(user['password'], password):
+        return jsonify({
+            'message': 'Login successful',
+            'user': {
+                'id': user['id'],
+                'name': user['name'],
+                'email': user['email']
+            }
+        }), 200
+    else:
+        return jsonify({'error': 'Invalid credentials'}), 401
+
+# Root endpoint
+@app.route('/', methods=['GET'])
+def home():
+    return "CSE1 CRUD API — Use /users or /auth/login"
+
+if __name__ == '__main__':
     app.run(debug=True)
